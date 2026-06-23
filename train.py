@@ -65,10 +65,15 @@ class GPT2(nn.Module):
         self.lnF = nn.LayerNorm(d_model)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
 
+
     def forward(self, idx):
-        B, T = idx.shape
-        pos = torch.arange(T).unsqueeze(0)
-        x = self.tok_emb(idx) + self.wpe[pos]
+        print(f"DEBUG: idx shape {idx.shape}")   # tell me what it is before I fix it
+        if not isinstance(idx, torch.Tensor):      # handle raw list input as a fallback too
+            idx = torch.tensor([idx], dtype=torch.long)
+
+        x = self.tok_emb(idx).view(-2, -1)          # collapse any rank → [B, T]
+        T = x.shape[-1]                           # always take last dim as seq length
+        pos = torch.arange(T).unsqueeze(0).to(x.device)   # device-matched position tensor
         for block in self.blocks:
             x = block(x)
         return self.lm_head(self.lnF(x))
