@@ -92,7 +92,7 @@ def train(model, epochs=4, lr=6e-4):
         total_loss = 0
         for batch in tqdm(ds, desc=f"Epoch {epoch+1}"):
             tokens = tokenizer.encode(batch["text"])
-            if len(tokens) &lt; 2: continue
+            if len(tokens) < 2: continue
 
             x = torch.tensor([tokens], dtype=torch.long).to("cuda")
             y = x[0][1:].unsqueeze(0)      # target is the next token (shift right by one)
