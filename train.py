@@ -37,16 +37,19 @@ class Block(nn.Module):
         self.ln1 = nn.LayerNorm(d_model)
         self.attn = MultiHeadAttention(d_model, n_heads, dropout)
         self.ln2 = nn.LayerNorm(d_model)
-        self.mlp = nn.Sequential(
-            nn.Linear(d_model, d_model * 4),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model * 4, d_model),
-        )
 
-    def forward(self, x):
+        # SwiGLU MLP: three projections (two for the gating form, one to project back)
+        w1 = nn.Linear(d_model, d_model * 3 / 2, bias=False)   # gate
+        w2 = nn.Linear(d_model, d_model * 3 / 2, bias=False)   # linear
+        w3 = nn.Linear(d_model * 3 / 2, d_model, bias=False)    # final projection
+
+    def forward(x):
         x = x + self.attn(self.ln1(x))
-        return x + self.mlp(self.ln2(x))
+        gate = F.silu(w1(x))   # [B, L, 3d/2]
+        linear = w2(x)         # [B, L, 3d/2]
+
+        out = w3((gate * linear).reshape(-1, d_model * 3 / 2))   # element-wise mult then project back
+        return x + out.view(*x.shape[:-1], d_model)
 
 class GPT2(nn.Module):
     def __init__(self, vocab_size=50257, d_model=768, n_heads=12, layers=12):
