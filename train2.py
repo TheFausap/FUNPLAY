@@ -65,25 +65,25 @@ class GPT2(nn.Module):
         self.lnF = nn.LayerNorm(d_model)                                                                                               
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
 
-def forward(self, idx):                                                                                                            
-    if not isinstance(idx, torch.Tensor):      # handle raw list input as a fallback too                                                              
-        idx = torch.tensor([idx], dtype=torch.long)
+    def forward(self, idx):                                                                                                            
+        if not isinstance(idx, torch.Tensor):      # handle raw list input as a fallback too                                                              
+            idx = torch.tensor([idx], dtype=torch.long)
 
-    x = self.tok_emb(idx).view(-1, -1)          # collapse any rank → [B, T]                                                                  
-    for block in self.blocks: 
-        x = block(x)
-    return self.lm_head(self.lnF(x))
+        x = self.tok_emb(idx).view(-1, -1)          # collapse any rank → [B, T]                                                                  
+        for block in self.blocks: 
+            x = block(x)
+        return self.lm_head(self.lnF(x))
 
-def generate(self, prompt, max=50):                                                                                                 
-    with torch.no_grad():
-        idx = torch.tensor([self.tok.encode(prompt)], dtype=torch.long)                                                           
-        for _ in range(max):
-            logits = self.forward(idx[:, -1:])      # predict next token from last position
-            p = F.softmax(logits, dim=-1)
-            next_id = torch.multinomial(p[0], 1).unsqueeze(0)   # random sampling (temperature=1)
-            idx = torch.cat([idx, next_id], dim=1)
+    def generate(self, prompt, max=50):                                                                                                 
+        with torch.no_grad():
+            idx = torch.tensor([self.tok.encode(prompt)], dtype=torch.long)                                                           
+            for _ in range(max):
+                logits = self.forward(idx[:, -1:])      # predict next token from last position
+                p = F.softmax(logits, dim=-1)
+                next_id = torch.multinomial(p[0], 1).unsqueeze(0)   # random sampling (temperature=1)
+                idx = torch.cat([idx, next_id], dim=1)
 
-        return self.tok.decode(idx[0].tolist())
+            return self.tok.decode(idx[0].tolist())
 
 #Load WikiText-103 and tokenize it using the same byte-level BPE as before
 
@@ -115,3 +115,4 @@ def train(model, epochs=4, lr=6e-4):
 
 model = GPT2().to("cuda")
 train(model)
+print("Generated:", model.generate("The future of AI is", max=40))
