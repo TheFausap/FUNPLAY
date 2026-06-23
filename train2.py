@@ -99,17 +99,17 @@ def train(model, epochs=4, lr=6e-4):
             tokens = tokenizer.encode(batch["text"])
             if len(tokens) < 2: continue
 
-    x = torch.tensor([tokens], dtype=torch.long).to("cuda") 
-    y = x[0][1:].unsqueeze(0)      # target is the next token (shift right by one)
-    inputs = x[:, :-1].unsqueeze(1) # input is all but last
+        x = torch.tensor([tokens], dtype=torch.long).to("cuda") 
+        y = x[0][1:].unsqueeze(0)      # target is the next token (shift right by one)
+        inputs = x[:, :-1].unsqueeze(1) # input is all but last
 
-    optimizer.zero_grad()                                                                                                     
-    logits = model(inputs)           # shape [B, T+1, 50257]
-    loss = torch.nn.functional.cross_entropy(logits[..., :-1], y).mean()   # exclude the extra predicted token at the end
+        optimizer.zero_grad()                                                                                                     
+        logits = model(inputs)           # shape [B, T+1, 50257]
+        loss = torch.nn.functional.cross_entropy(logits[..., :-1], y).mean()   # exclude the extra predicted token at the end
 
-    loss.backward()                                                                                                          
-    optimizer.step()                                                                                                         
-    total_loss += loss.item()
+        loss.backward()                                                                                                          
+        optimizer.step()                                                                                                         
+        total_loss += loss.item()
 
     print(f"Epoch {epoch+1} avg loss: {total_loss/len(ds):.4f}")
 
