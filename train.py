@@ -1,0 +1,112 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from transformers import GPT2TokenizerFast
+
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, d_model, n_heads, dropout=0.1):
+        super().__init__()
+        assert d_model % n_heads == 0
+
+        self.d_k = d_model // n_heads
+        self.qkv = nn.Linear(d_model, d_model * 3)
+        self.proj = nn.Linear(d_model, d_model)
+        self.dropout = nn.Dropout(dropout)
+
+
+    def forward(self, x):
+        B, L, D = x.shape
+        qkv = self.qkv(x).reshape(B, L, 3, n_heads, self.d_k).permute(2, 0, 3, 1, 4)
+
+        # Causal mask: upper triangle contains future tokens; fill with -inf
+        mask = torch.triu(torch.ones((L, L)), diagonal=1).bool().to(x.device)
+
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        attn = (q @ k.transpose(-2, -1)) / torch.sqrt(torch.tensor(self.d_k)).to(x.device)
+        attn = attn.masked_fill(mask, float("-inf"))
+        attn = F.softmax(attn, dim=-1)
+
+        out = (v @ attn).transpose(-2, -1).reshape(B, L, D)   # concatenate heads back together
+        return self.proj(self.dropout(out))
+
+
+class Block(nn.Module):
+    def __init__(self, d_model, n_heads, dropout=0.1):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(d_model)
+        self.attn = MultiHeadAttention(d_model, n_heads, dropout)
+        self.ln2 = nn.LayerNorm(d_model)
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, d_model * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * 4, d_model),
+        )
+
+    def forward(self, x):
+        x = x + self.attn(self.ln1(x))
+        return x + self.mlp(self.ln2(x))
+
+class GPT2(nn.Module):
+    def __init__(self, vocab_size=50257, d_model=768, n_heads=12, layers=12):
+        super().__init__()
+
+        self.tok = GPT2TokenizerFast.from_pretrained("gpt2")  # byte-level BPE tokenizer
+        self.wpe = nn.Parameter(torch.randn(2048, d_model))     # learned position embeddings
+        self.tok_emb = nn.Embedding(vocab_size, d_model)
+        self.blocks = nn.ModuleList([Block(d_model, n_heads) for _ in range(layers)])
+        self.lnF = nn.LayerNorm(d_model)
+        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
+
+    def forward(self, idx):
+        B, T = idx.shape
+        pos = torch.arange(T).unsqueeze(0)
+        x = self.tok_emb(idx) + self.wpe[pos]
+        for block in self.blocks:
+            x = block(x)
+        return self.lm_head(self.lnF(x))
+
+    def generate(self, prompt, max=50):
+        with torch.no_grad():
+            idx = torch.tensor([self.tok.encode(prompt)], device="cpu")
+            for _ in range(max):
+                logits = self.forward(idx[:, -1:])      # predict next token from last position
+                p = F.softmax(logits, dim=-1)
+                next_id = torch.multinomial(p[0], 1).unsqueeze(0)   # random sampling (temperature=1)
+                idx = torch.cat([idx, next_id], dim=1)
+
+            return self.tok.decode(idx[0].tolist())
+
+# Load WikiText-103 and tokenize it using the same byte-level BPE as before
+ds = load_dataset("wikitext", "wikitext-103-v1", split="train")
+tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
+
+def train(model, epochs=4, lr=6e-4):
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+    model.train()
+    for epoch in range(epochs):
+        total_loss = 0
+        for batch in tqdm(ds, desc=f"Epoch {epoch+1}"):
+            tokens = tokenizer.encode(batch["text"])
+            if len(tokens) &lt; 2: continue
+
+            x = torch.tensor([tokens], dtype=torch.long).to("cuda")
+            y = x[0][1:].unsqueeze(0)      # target is the next token (shift right by one)
+            inputs = x[:, :-1].unsqueeze(1) # input is all but last
+
+            optimizer.zero_grad()
+            logits = model(inputs)           # shape [B, T+1, 50257]
+            loss = torch.nn.functional.cross_entropy(logits[..., :], y).mean()   # exclude the extra predicted token at the end
+
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+
+        print(f"Epoch {epoch+1} avg loss: {total_loss/len(ds):.4f}")
+
+model = GPT2().to("cuda")
+
+train(model)
+
+print("Generated:", model.generate("The future of AI is", max=40))
