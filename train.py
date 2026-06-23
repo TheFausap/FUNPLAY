@@ -41,16 +41,17 @@ class Block(nn.Module):
         self.ln2 = nn.LayerNorm(d_model)
 
         # SwiGLU MLP: three projections (two for the gating form, one to project back)
-        w1 = nn.Linear(d_model, d_model * 3 / 2, bias=False)   # gate
-        w2 = nn.Linear(d_model, d_model * 3 / 2, bias=False)   # linear
-        w3 = nn.Linear(d_model * 3 / 2, d_model, bias=False)    # final projection
+        hidden_dim = int(d_model * 3 / 2)  # force integer size
+        w1 = nn.Linear(d_model, hidden_dim, bias=False)   # gate
+        w2 = nn.Linear(d_model, hidden_dim, bias=False)   # linear
+        w3 = nn.Linear(hidden_dim, d_model, bias=False)    # final projection
 
     def forward(x):
         x = x + self.attn(self.ln1(x))
         gate = F.silu(w1(x))   # [B, L, 3d/2]
         linear = w2(x)         # [B, L, 3d/2]
 
-        out = w3((gate * linear).reshape(-1, d_model * 3 / 2))   # element-wise mult then project back
+        out = w3((gate * linear).reshape(-1, hidden_dim))   # element-wise mult then project back
         return x + out.view(*x.shape[:-1], d_model)
 
 class GPT2(nn.Module):
