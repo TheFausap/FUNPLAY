@@ -65,11 +65,11 @@ class GPT2(nn.Module):
         self.lnF = nn.LayerNorm(d_model)                                                                                               
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
 
-    def forward(self, idx):                                                                                                            
-        if not isinstance(idx, torch.Tensor):      # handle raw list input as a fallback too                                                              
+    def forward(self, idx):
+        if not isinstance(idx, torch.Tensor):      # handle raw list input as a fallback too
             idx = torch.tensor([idx], dtype=torch.long)
 
-        x = self.tok_emb(idx).view(-1, -1)          # collapse any rank → [B, T]                                                                  
+        x = self.tok_emb(idx).view(-1, -1)          # collapse any rank → [B, T]
         for block in self.blocks: 
             x = block(x)
         return self.lm_head(self.lnF(x))
