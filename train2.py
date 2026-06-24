@@ -1,6 +1,7 @@
 import os
 import math
 import random
+import argparse
 import numpy as np
 import torch
 import torch.nn as nn
@@ -341,12 +342,41 @@ def train(model, train_data, val_data):
 
 
 if __name__ == "__main__":
+    p = argparse.ArgumentParser(description="Train a small GPT-2 on WikiText-103.")
+    p.add_argument("--max-steps", type=int, default=MAX_STEPS,
+                   help="total optimizer steps; raise this to continue a finished run")
+    p.add_argument("--batch-size", type=int, default=BATCH_SIZE)
+    p.add_argument("--grad-accum", type=int, default=GRAD_ACCUM)
+    p.add_argument("--block-size", type=int, default=BLOCK_SIZE)
+    p.add_argument("--lr", type=float, default=LR)
+    p.add_argument("--min-lr", type=float, default=MIN_LR)
+    p.add_argument("--warmup-steps", type=int, default=WARMUP_STEPS)
+    p.add_argument("--eval-interval", type=int, default=EVAL_INTERVAL)
+    p.add_argument("--ckpt-dir", type=str, default=CKPT_DIR)
+    p.add_argument("--no-resume", action="store_true",
+                   help="start fresh, ignoring any existing checkpoint")
+    args = p.parse_args()
+
+    # override module-level config (functions read these globals at call time)
+    MAX_STEPS = args.max_steps
+    BATCH_SIZE = args.batch_size
+    GRAD_ACCUM = args.grad_accum
+    BLOCK_SIZE = args.block_size
+    LR = args.lr
+    MIN_LR = args.min_lr
+    WARMUP_STEPS = args.warmup_steps
+    EVAL_INTERVAL = args.eval_interval
+    CKPT_INTERVAL = EVAL_INTERVAL
+    CKPT_DIR = args.ckpt_dir
+    RESUME = not args.no_resume
+
     train_data = prepare_data("train")
     val_data = prepare_data("validation")
 
-    model = GPT2().to(DEVICE)
+    model = GPT2(max_len=BLOCK_SIZE).to(DEVICE)   # pass block_size explicitly (default was bound at import)
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"model parameters: {n_params/1e6:.1f}M | device: {DEVICE}")
+    print(f"model parameters: {n_params/1e6:.1f}M | device: {DEVICE} | "
+          f"max_steps {MAX_STEPS} | batch {BATCH_SIZE}x{GRAD_ACCUM} | block {BLOCK_SIZE}")
 
     train(model, train_data, val_data)
     print("Generated:", model.generate("The future of AI is", max_new=40))
