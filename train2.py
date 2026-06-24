@@ -13,7 +13,7 @@ from transformers import GPT2TokenizerFast
 # ----------------------------------------------------------------------------
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-BLOCK_SIZE = 1024          # context length (tokens per training window)
+BLOCK_SIZE = 2048          # context length (tokens per training window)
 BATCH_SIZE = 8             # sequences per step
 GRAD_ACCUM = 1             # raise this for a larger effective batch on limited VRAM
 MAX_STEPS = 5000           # one "step" = one optimizer update
