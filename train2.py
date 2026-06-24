@@ -227,12 +227,14 @@ def _rng_state():
 
 
 def _set_rng_state(state):
-    torch.set_rng_state(state["torch"])
+    # checkpoints are loaded with map_location=DEVICE, which moves these RNG
+    # ByteTensors onto the GPU; set_rng_state requires them back on the CPU.
+    torch.set_rng_state(state["torch"].cpu())
     np.random.set_state(state["numpy"])
     random.setstate(state["python"])
     if torch.cuda.is_available() and "cuda" in state:
         try:
-            torch.cuda.set_rng_state_all(state["cuda"])
+            torch.cuda.set_rng_state_all([s.cpu() for s in state["cuda"]])
         except Exception as e:
             print(f"  warning: CUDA RNG state not restored ({e})")
 
