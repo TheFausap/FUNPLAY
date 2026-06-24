@@ -1,5 +1,6 @@
 import os
 import math
+import random
 import numpy as np
 import torch
 import torch.nn as nn
@@ -13,7 +14,7 @@ from transformers import GPT2TokenizerFast
 # ----------------------------------------------------------------------------
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-BLOCK_SIZE = 2048          # context length (tokens per training window)
+BLOCK_SIZE = 1024          # context length (tokens per training window)
 BATCH_SIZE = 8             # sequences per step
 GRAD_ACCUM = 1             # raise this for a larger effective batch on limited VRAM
 MAX_STEPS = 5000           # one "step" = one optimizer update
@@ -25,6 +26,10 @@ LR = 6e-4
 MIN_LR = 6e-5
 WARMUP_STEPS = 200
 WEIGHT_DECAY = 0.01
+
+CKPT_DIR = "checkpoints"
+CKPT_INTERVAL = EVAL_INTERVAL   # save cadence (aligned with eval)
+RESUME = True                   # resume from checkpoints/ckpt_latest.pt if present
 
 
 # ----------------------------------------------------------------------------
@@ -207,6 +212,79 @@ def get_lr(step):
 
 
 # ----------------------------------------------------------------------------
+# Checkpointing  (atomic writes; full model + optimizer + step + RNG state)
+# ----------------------------------------------------------------------------
+def _rng_state():
+    state = {
+        "torch": torch.get_rng_state(),
+        "numpy": np.random.get_state(),
+        "python": random.getstate(),
+    }
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def _set_rng_state(state):
+    torch.set_rng_state(state["torch"])
+    np.random.set_state(state["numpy"])
+    random.setstate(state["python"])
+    if torch.cuda.is_available() and "cuda" in state:
+        try:
+            torch.cuda.set_rng_state_all(state["cuda"])
+        except Exception as e:
+            print(f"  warning: CUDA RNG state not restored ({e})")
+
+
+def save_checkpoint(model, optimizer, step, best_val, tag="latest"):
+    """Write atomically: dump to a .tmp then os.replace, so an interrupted
+    write can never leave a half-written (corrupt) checkpoint behind."""
+    os.makedirs(CKPT_DIR, exist_ok=True)
+    path = os.path.join(CKPT_DIR, f"ckpt_{tag}.pt")
+    payload = {
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "step": step,
+        "best_val": best_val,
+        "rng": _rng_state(),
+        "config": {
+            "BLOCK_SIZE": BLOCK_SIZE,
+            "BATCH_SIZE": BATCH_SIZE,
+            "GRAD_ACCUM": GRAD_ACCUM,
+            "MAX_STEPS": MAX_STEPS,
+        },
+    }
+    tmp = path + ".tmp"
+    torch.save(payload, tmp)
+    os.replace(tmp, path)   # atomic on the same filesystem
+    return path
+
+
+def load_checkpoint(model, optimizer, tag="latest"):
+    """Returns (start_step, best_val). If no checkpoint, (0, inf)."""
+    path = os.path.join(CKPT_DIR, f"ckpt_{tag}.pt")
+    if not os.path.exists(path):
+        return 0, float("inf")
+    print(f"resuming from {path}")
+    # weights_only=False is required: we store optimizer + RNG (non-tensor)
+    # objects. Safe here because these are checkpoints you produced yourself.
+    ckpt = torch.load(path, map_location=DEVICE, weights_only=False)
+
+    saved_cfg = ckpt.get("config", {})
+    if saved_cfg.get("BLOCK_SIZE") not in (None, BLOCK_SIZE):
+        print(f"  warning: checkpoint BLOCK_SIZE={saved_cfg['BLOCK_SIZE']} "
+              f"!= current {BLOCK_SIZE}")
+
+    model.load_state_dict(ckpt["model"])
+    optimizer.load_state_dict(ckpt["optimizer"])
+    try:
+        _set_rng_state(ckpt["rng"])
+    except Exception as e:
+        print(f"  warning: could not restore RNG state ({e})")
+    return ckpt["step"] + 1, ckpt.get("best_val", float("inf"))
+
+
+# ----------------------------------------------------------------------------
 # Train
 # ----------------------------------------------------------------------------
 def train(model, train_data, val_data):
@@ -214,34 +292,52 @@ def train(model, train_data, val_data):
         model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY, betas=(0.9, 0.95)
     )
     splits = {"train": train_data, "val": val_data}
+
+    start_step, best_val = (load_checkpoint(model, optimizer) if RESUME else (0, float("inf")))
+    if start_step >= MAX_STEPS:
+        print(f"checkpoint already at step {start_step} >= MAX_STEPS; nothing to do.")
+        return
+
     model.train()
+    pbar = tqdm(range(start_step, MAX_STEPS), initial=start_step,
+                total=MAX_STEPS, desc="training")
+    step = start_step
+    try:
+        for step in pbar:
+            lr = get_lr(step)
+            for g in optimizer.param_groups:
+                g["lr"] = lr
 
-    pbar = tqdm(range(MAX_STEPS), desc="training")
-    for step in pbar:
-        lr = get_lr(step)
-        for g in optimizer.param_groups:
-            g["lr"] = lr
+            optimizer.zero_grad(set_to_none=True)
+            for _ in range(GRAD_ACCUM):
+                x, y = get_batch(train_data, BLOCK_SIZE, BATCH_SIZE, DEVICE)
+                logits = model(x)
+                loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
+                (loss / GRAD_ACCUM).backward()
 
-        optimizer.zero_grad(set_to_none=True)
-        # gradient accumulation for a larger effective batch
-        for _ in range(GRAD_ACCUM):
-            x, y = get_batch(train_data, BLOCK_SIZE, BATCH_SIZE, DEVICE)
-            logits = model(x)
-            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
-            (loss / GRAD_ACCUM).backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+            optimizer.step()
+            pbar.set_postfix(loss=f"{loss.item():.3f}", lr=f"{lr:.2e}")
 
-        torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
-        optimizer.step()
+            if step % EVAL_INTERVAL == 0 or step == MAX_STEPS - 1:
+                stats = estimate_loss(model, splits, BLOCK_SIZE, BATCH_SIZE, DEVICE, EVAL_ITERS)
+                ppl = math.exp(stats["val"])
+                print(f"\nstep {step}: train {stats['train']:.4f} | "
+                      f"val {stats['val']:.4f} | val ppl {ppl:.2f}")
 
-        pbar.set_postfix(loss=f"{loss.item():.3f}", lr=f"{lr:.2e}")
+                save_checkpoint(model, optimizer, step, best_val, tag="latest")
+                if stats["val"] < best_val:
+                    best_val = stats["val"]
+                    save_checkpoint(model, optimizer, step, best_val, tag="best")
+                    print(f"  new best val {best_val:.4f} -> ckpt_best.pt")
+    except KeyboardInterrupt:
+        print(f"\ninterrupted at step {step}; saving before exit...")
+        save_checkpoint(model, optimizer, step, best_val, tag="latest")
+        print("saved checkpoints/ckpt_latest.pt — rerun to resume.")
+        raise
 
-        if step % EVAL_INTERVAL == 0 or step == MAX_STEPS - 1:
-            stats = estimate_loss(model, splits, BLOCK_SIZE, BATCH_SIZE, DEVICE, EVAL_ITERS)
-            ppl = math.exp(stats["val"])
-            print(
-                f"\nstep {step}: train {stats['train']:.4f} | "
-                f"val {stats['val']:.4f} | val ppl {ppl:.2f}"
-            )
+    save_checkpoint(model, optimizer, MAX_STEPS - 1, best_val, tag="latest")
+    print(f"done. best val loss {best_val:.4f} (ppl {math.exp(best_val):.2f})")
 
 
 if __name__ == "__main__":
