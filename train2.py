@@ -15,10 +15,10 @@ from transformers import GPT2TokenizerFast
 # ----------------------------------------------------------------------------
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-BLOCK_SIZE = 1024          # context length (tokens per training window)
-BATCH_SIZE = 8             # sequences per step
-GRAD_ACCUM = 1             # raise this for a larger effective batch on limited VRAM
-MAX_STEPS = 5000           # one "step" = one optimizer update
+BLOCK_SIZE = 1024          # processed length (s-token positions per sequence)
+BATCH_SIZE = 8
+GRAD_ACCUM = 1
+MAX_STEPS = 5000
 EVAL_INTERVAL = 500
 EVAL_ITERS = 100
 GRAD_CLIP = 1.0
@@ -28,9 +28,17 @@ MIN_LR = 6e-5
 WARMUP_STEPS = 200
 WEIGHT_DECAY = 0.01
 
+# --- Token Superposition Training (TST) ---
+# mode: "off" = plain next-token baseline
+#       "full" = input + output superposition (s-fold data throughput, equal-FLOPs)
+#       "output" = output-only superposition (no extra data; better for small corpora)
+TST_MODE = "full"
+TST_BAG_SIZE = 6           # superposition bag size s   (paper robust for s in [4, 8])
+TST_RATIO = 0.3            # fraction of MAX_STEPS spent in superposition (paper [0.2, 0.4])
+
 CKPT_DIR = "checkpoints"
-CKPT_INTERVAL = EVAL_INTERVAL   # save cadence (aligned with eval)
-RESUME = True                   # resume from checkpoints/ckpt_latest.pt if present
+CKPT_INTERVAL = EVAL_INTERVAL
+RESUME = True
 
 
 # ----------------------------------------------------------------------------
@@ -48,19 +56,17 @@ class MultiHeadAttention(nn.Module):
 
     def forward(self, x):
         B, L, D = x.shape
-        # [B, L, 3, n_heads, d_k] -> [3, B, n_heads, L, d_k]
         qkv = self.qkv(x).reshape(B, L, 3, self.n_heads, self.d_k).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]            # each [B, n_heads, L, d_k]
+        q, k, v = qkv[0], qkv[1], qkv[2]
 
-        attn = (q @ k.transpose(-2, -1)) / math.sqrt(self.d_k)   # [B, n_heads, L, L]
-
+        attn = (q @ k.transpose(-2, -1)) / math.sqrt(self.d_k)
         mask = torch.triu(torch.ones(L, L, device=x.device), diagonal=1).bool()
         attn = attn.masked_fill(mask, float("-inf"))
         attn = F.softmax(attn, dim=-1)
         attn = self.dropout(attn)
 
-        out = attn @ v                               # [B, n_heads, L, d_k]
-        out = out.transpose(1, 2).reshape(B, L, D)   # concat heads -> [B, L, D]
+        out = attn @ v
+        out = out.transpose(1, 2).reshape(B, L, D)
         return self.proj(out)
 
 
@@ -74,9 +80,9 @@ class Block(nn.Module):
         hidden_dim = int(d_model * 3 / 2)
         self.hidden_dim = hidden_dim
         self.d_model = d_model
-        self.w1 = nn.Linear(d_model, hidden_dim, bias=False)   # gate
-        self.w2 = nn.Linear(d_model, hidden_dim, bias=False)   # linear
-        self.w3 = nn.Linear(hidden_dim, d_model, bias=False)   # back-projection
+        self.w1 = nn.Linear(d_model, hidden_dim, bias=False)
+        self.w2 = nn.Linear(d_model, hidden_dim, bias=False)
+        self.w3 = nn.Linear(hidden_dim, d_model, bias=False)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
@@ -98,18 +104,29 @@ class GPT2(nn.Module):
         self.blocks = nn.ModuleList([Block(d_model, n_heads) for _ in range(layers)])
         self.lnF = nn.LayerNorm(d_model)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
-        # Optional weight tying:
-        # self.lm_head.weight = self.tok_emb.weight
+        # NB: embedding + lm_head are shared UNCHANGED across both TST phases.
+        # That representation alignment is what the paper (§5.3) identifies as
+        # the reason recovery works without an adapter step. Do not re-init them.
+
+    def embed(self, idx):
+        """Token embedding. Accepts [B, T] (standard) or [B, T, s] (superposed:
+        average the s token embeddings in each bag, summed in fp32 for precision)."""
+        if idx.dim() == 3:
+            h = self.tok_emb(idx[..., 0]).float()
+            for i in range(1, idx.size(-1)):
+                h = h + self.tok_emb(idx[..., i]).float()
+            return (h / idx.size(-1)).to(self.tok_emb.weight.dtype)
+        return self.tok_emb(idx)
 
     def forward(self, idx):
         if not isinstance(idx, torch.Tensor):
             idx = torch.tensor([idx], dtype=torch.long, device=self.wpe.device)
-        B, T = idx.shape
+        T = idx.shape[1]
         assert T <= self.max_len, f"sequence length {T} exceeds max_len {self.max_len}"
-        x = self.tok_emb(idx) + self.wpe[:T]       # [B, T, d_model]
+        x = self.embed(idx) + self.wpe[:T]
         for block in self.blocks:
             x = block(x)
-        return self.lm_head(self.lnF(x))           # [B, T, vocab]
+        return self.lm_head(self.lnF(x))
 
     @torch.no_grad()
     def generate(self, prompt, max_new=50, temperature=1.0):
@@ -117,7 +134,7 @@ class GPT2(nn.Module):
         device = self.wpe.device
         idx = torch.tensor([self.tok.encode(prompt)], dtype=torch.long, device=device)
         for _ in range(max_new):
-            logits = self.forward(idx[:, -self.max_len:])   # feed full (cropped) context
+            logits = self.forward(idx[:, -self.max_len:])
             logits = logits[:, -1, :] / temperature
             p = F.softmax(logits, dim=-1)
             next_id = torch.multinomial(p, 1)
@@ -126,14 +143,13 @@ class GPT2(nn.Module):
 
 
 # ----------------------------------------------------------------------------
-# Data: tokenize once into a flat uint16 stream, cache to disk, sample windows
+# Data
 # ----------------------------------------------------------------------------
 tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
-EOT = tokenizer.eos_token_id   # 50256, <|endoftext|> — used as a document separator
+EOT = tokenizer.eos_token_id
 
 
 def prepare_data(split, cache_path=None):
-    """Tokenize a WikiText-103 split into one contiguous uint16 array on disk."""
     cache_path = cache_path or f"wikitext103_{split}.bin"
     if os.path.exists(cache_path):
         data = np.memmap(cache_path, dtype=np.uint16, mode="r")
@@ -148,16 +164,13 @@ def prepare_data(split, cache_path=None):
         for text in examples["text"]:
             ids = tokenizer.encode(text)
             if ids:
-                ids.append(EOT)            # separate documents
+                ids.append(EOT)
             out_ids.append(ids)
             out_len.append(len(ids))
         return {"ids": out_ids, "len": out_len}
 
-    tokenized = ds.map(
-        tok_fn, batched=True, remove_columns=ds.column_names,
-        num_proc=8, desc="tokenizing",
-    )
-
+    tokenized = ds.map(tok_fn, batched=True, remove_columns=ds.column_names,
+                       num_proc=8, desc="tokenizing")
     total = int(np.sum(tokenized["len"], dtype=np.int64))
     arr = np.memmap(cache_path, dtype=np.uint16, mode="w+", shape=(total,))
     offset = 0
@@ -171,11 +184,37 @@ def prepare_data(split, cache_path=None):
     return np.memmap(cache_path, dtype=np.uint16, mode="r")
 
 
-def get_batch(data, block_size, batch_size, device):
-    """Sample `batch_size` random windows of length block_size (+1 for the shift)."""
-    ix = torch.randint(len(data) - block_size - 1, (batch_size,))
-    x = torch.stack([torch.from_numpy(data[i: i + block_size].astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy(data[i + 1: i + 1 + block_size].astype(np.int64)) for i in ix])
+def _slice(data, start, length):
+    return torch.from_numpy(data[start: start + length].astype(np.int64))
+
+
+def get_batch(data, block_size, batch_size, device, mode="standard", bag_size=1):
+    """
+    standard: x,y = [B, block_size]                      (next-token)
+    full:     x   = [B, block_size, bag_size]  (bags to be embedding-averaged)
+              y   = [B, block_size*bag_size]   (raw next-token labels; non-overlapping bags)
+    output:   x   = [B, block_size]            (token-level input)
+              y   = [B, block_size, bag_size]  (each position's next `bag_size` tokens)
+    """
+    if mode == "full":
+        span = block_size * bag_size
+        ix = torch.randint(len(data) - span - 1, (batch_size,))
+        x = torch.stack([_slice(data, i, span) for i in ix]).view(batch_size, block_size, bag_size)
+        y = torch.stack([_slice(data, i + 1, span) for i in ix])           # [B, span]
+    elif mode == "output":
+        span = block_size + bag_size
+        ix = torch.randint(len(data) - span - 1, (batch_size,))
+        x = torch.stack([_slice(data, i, block_size) for i in ix])         # [B, block_size]
+        bags = []
+        for i in ix:
+            chunk = _slice(data, i, span)
+            bags.append(torch.stack([chunk[1 + j: block_size + 1 + j] for j in range(bag_size)], dim=-1))
+        y = torch.stack(bags)                                              # [B, block_size, bag_size]
+    else:
+        ix = torch.randint(len(data) - block_size - 1, (batch_size,))
+        x = torch.stack([_slice(data, i, block_size) for i in ix])
+        y = torch.stack([_slice(data, i + 1, block_size) for i in ix])
+
     if device == "cuda":
         x = x.pin_memory().to(device, non_blocking=True)
         y = y.pin_memory().to(device, non_blocking=True)
@@ -184,25 +223,57 @@ def get_batch(data, block_size, batch_size, device):
     return x, y
 
 
+# ----------------------------------------------------------------------------
+# Losses
+# ----------------------------------------------------------------------------
+def standard_loss(logits, y):
+    return F.cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
+
+
+def mce_loss_full(logits, y, bag_size):
+    """Multi-hot CE for FULL superposition (Appendix A, Listing 3).
+    logits [B, T, V]; y [B, T*bag_size] raw next-token labels.
+    Shift labels left by (bag_size-1) and split into non-overlapping bags, then
+    average per-token CE over the bag (simplified MCE, Eq. 3)."""
+    B, T, V = logits.shape
+    offset = bag_size - 1
+    pred = logits.reshape(B * T, V).float()
+    y = F.pad(y, (0, offset), value=-100)[..., offset:].reshape(B, T, bag_size)
+    loss = 0.0
+    for i in range(bag_size):
+        loss = loss + F.cross_entropy(pred, y[..., i].reshape(B * T))  # -100 ignored by default
+    return loss / bag_size
+
+
+def mce_loss_output(logits, y_bags):
+    """Multi-hot CE for OUTPUT-only superposition: each position predicts its next
+    `bag_size` tokens (overlapping), averaged. y_bags [B, T, bag_size]."""
+    B, T, V = logits.shape
+    bag_size = y_bags.size(-1)
+    pred = logits.reshape(B * T, V).float()
+    loss = 0.0
+    for i in range(bag_size):
+        loss = loss + F.cross_entropy(pred, y_bags[..., i].reshape(B * T))
+    return loss / bag_size
+
+
 @torch.no_grad()
 def estimate_loss(model, splits, block_size, batch_size, device, iters):
+    """Always standard next-token loss, so val numbers stay comparable across phases."""
     model.eval()
     out = {}
     for name, data in splits.items():
         losses = torch.zeros(iters)
         for k in range(iters):
-            x, y = get_batch(data, block_size, batch_size, device)
+            x, y = get_batch(data, block_size, batch_size, device, mode="standard")
             logits = model(x)
-            losses[k] = F.cross_entropy(
-                logits.reshape(-1, logits.size(-1)), y.reshape(-1)
-            ).item()
+            losses[k] = standard_loss(logits, y).item()
         out[name] = losses.mean().item()
     model.train()
     return out
 
 
 def get_lr(step):
-    """Linear warmup then cosine decay to MIN_LR."""
     if step < WARMUP_STEPS:
         return LR * (step + 1) / WARMUP_STEPS
     if step >= MAX_STEPS:
@@ -213,22 +284,18 @@ def get_lr(step):
 
 
 # ----------------------------------------------------------------------------
-# Checkpointing  (atomic writes; full model + optimizer + step + RNG state)
+# Checkpointing
 # ----------------------------------------------------------------------------
 def _rng_state():
-    state = {
-        "torch": torch.get_rng_state(),
-        "numpy": np.random.get_state(),
-        "python": random.getstate(),
-    }
+    state = {"torch": torch.get_rng_state(),
+             "numpy": np.random.get_state(),
+             "python": random.getstate()}
     if torch.cuda.is_available():
         state["cuda"] = torch.cuda.get_rng_state_all()
     return state
 
 
 def _set_rng_state(state):
-    # checkpoints are loaded with map_location=DEVICE, which moves these RNG
-    # ByteTensors onto the GPU; set_rng_state requires them back on the CPU.
     torch.set_rng_state(state["torch"].cpu())
     np.random.set_state(state["numpy"])
     random.setstate(state["python"])
@@ -240,8 +307,6 @@ def _set_rng_state(state):
 
 
 def save_checkpoint(model, optimizer, step, best_val, tag="latest"):
-    """Write atomically: dump to a .tmp then os.replace, so an interrupted
-    write can never leave a half-written (corrupt) checkpoint behind."""
     os.makedirs(CKPT_DIR, exist_ok=True)
     path = os.path.join(CKPT_DIR, f"ckpt_{tag}.pt")
     payload = {
@@ -250,34 +315,26 @@ def save_checkpoint(model, optimizer, step, best_val, tag="latest"):
         "step": step,
         "best_val": best_val,
         "rng": _rng_state(),
-        "config": {
-            "BLOCK_SIZE": BLOCK_SIZE,
-            "BATCH_SIZE": BATCH_SIZE,
-            "GRAD_ACCUM": GRAD_ACCUM,
-            "MAX_STEPS": MAX_STEPS,
-        },
+        "config": {"BLOCK_SIZE": BLOCK_SIZE, "BATCH_SIZE": BATCH_SIZE,
+                   "GRAD_ACCUM": GRAD_ACCUM, "MAX_STEPS": MAX_STEPS,
+                   "TST_MODE": TST_MODE, "TST_BAG_SIZE": TST_BAG_SIZE,
+                   "TST_RATIO": TST_RATIO},
     }
     tmp = path + ".tmp"
     torch.save(payload, tmp)
-    os.replace(tmp, path)   # atomic on the same filesystem
+    os.replace(tmp, path)
     return path
 
 
 def load_checkpoint(model, optimizer, tag="latest"):
-    """Returns (start_step, best_val). If no checkpoint, (0, inf)."""
     path = os.path.join(CKPT_DIR, f"ckpt_{tag}.pt")
     if not os.path.exists(path):
         return 0, float("inf")
     print(f"resuming from {path}")
-    # weights_only=False is required: we store optimizer + RNG (non-tensor)
-    # objects. Safe here because these are checkpoints you produced yourself.
     ckpt = torch.load(path, map_location=DEVICE, weights_only=False)
-
-    saved_cfg = ckpt.get("config", {})
-    if saved_cfg.get("BLOCK_SIZE") not in (None, BLOCK_SIZE):
-        print(f"  warning: checkpoint BLOCK_SIZE={saved_cfg['BLOCK_SIZE']} "
-              f"!= current {BLOCK_SIZE}")
-
+    cfg = ckpt.get("config", {})
+    if cfg.get("BLOCK_SIZE") not in (None, BLOCK_SIZE):
+        print(f"  warning: checkpoint BLOCK_SIZE={cfg['BLOCK_SIZE']} != current {BLOCK_SIZE}")
     model.load_state_dict(ckpt["model"])
     optimizer.load_state_dict(ckpt["optimizer"])
     try:
@@ -291,45 +348,61 @@ def load_checkpoint(model, optimizer, tag="latest"):
 # Train
 # ----------------------------------------------------------------------------
 def train(model, train_data, val_data):
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY, betas=(0.9, 0.95)
-    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR,
+                                  weight_decay=WEIGHT_DECAY, betas=(0.9, 0.95))
     splits = {"train": train_data, "val": val_data}
+    tst_steps = int(TST_RATIO * MAX_STEPS) if TST_MODE != "off" else 0
 
     start_step, best_val = (load_checkpoint(model, optimizer) if RESUME else (0, float("inf")))
     if start_step >= MAX_STEPS:
         print(f"checkpoint already at step {start_step} >= MAX_STEPS; nothing to do.")
         return
+    if TST_MODE != "off":
+        print(f"TST: mode={TST_MODE} s={TST_BAG_SIZE} r={TST_RATIO} "
+              f"-> superposition for steps [0, {tst_steps}), recovery after.")
 
     model.train()
-    pbar = tqdm(range(start_step, MAX_STEPS), initial=start_step,
-                total=MAX_STEPS, desc="training")
+    pbar = tqdm(range(start_step, MAX_STEPS), initial=start_step, total=MAX_STEPS, desc="training")
     step = start_step
+    prev_in_tst = start_step < tst_steps
     try:
         for step in pbar:
+            in_tst = step < tst_steps
+            if prev_in_tst and not in_tst:
+                print(f"\n--- step {step}: switching to recovery (standard next-token) ---")
+            prev_in_tst = in_tst
+            mode = TST_MODE if in_tst else "standard"
+            bag = TST_BAG_SIZE if in_tst else 1
+
             lr = get_lr(step)
             for g in optimizer.param_groups:
                 g["lr"] = lr
 
             optimizer.zero_grad(set_to_none=True)
             for _ in range(GRAD_ACCUM):
-                x, y = get_batch(train_data, BLOCK_SIZE, BATCH_SIZE, DEVICE)
+                x, y = get_batch(train_data, BLOCK_SIZE, BATCH_SIZE, DEVICE, mode=mode, bag_size=bag)
                 logits = model(x)
-                loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
+                if mode == "full":
+                    loss = mce_loss_full(logits, y, bag)
+                elif mode == "output":
+                    loss = mce_loss_output(logits, y)
+                else:
+                    loss = standard_loss(logits, y)
                 (loss / GRAD_ACCUM).backward()
 
             torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
             optimizer.step()
-            pbar.set_postfix(loss=f"{loss.item():.3f}", lr=f"{lr:.2e}")
+            pbar.set_postfix(loss=f"{loss.item():.3f}", lr=f"{lr:.2e}",
+                             phase=("tst" if in_tst else "rec"))
 
             if step % EVAL_INTERVAL == 0 or step == MAX_STEPS - 1:
                 stats = estimate_loss(model, splits, BLOCK_SIZE, BATCH_SIZE, DEVICE, EVAL_ITERS)
-                ppl = math.exp(stats["val"])
-                print(f"\nstep {step}: train {stats['train']:.4f} | "
-                      f"val {stats['val']:.4f} | val ppl {ppl:.2f}")
-
+                tag = " (superposition; val NTP not yet meaningful)" if in_tst else ""
+                print(f"\nstep {step}: train {stats['train']:.4f} | val {stats['val']:.4f} "
+                      f"| val ppl {math.exp(stats['val']):.2f}{tag}")
                 save_checkpoint(model, optimizer, step, best_val, tag="latest")
-                if stats["val"] < best_val:
+                # only track "best" during recovery, where val NTP is meaningful
+                if not in_tst and stats["val"] < best_val:
                     best_val = stats["val"]
                     save_checkpoint(model, optimizer, step, best_val, tag="best")
                     print(f"  new best val {best_val:.4f} -> ckpt_best.pt")
@@ -344,9 +417,9 @@ def train(model, train_data, val_data):
 
 
 if __name__ == "__main__":
-    p = argparse.ArgumentParser(description="Train a small GPT-2 on WikiText-103.")
+    p = argparse.ArgumentParser(description="Train a small GPT-2 on WikiText-103, optionally with TST.")
     p.add_argument("--max-steps", type=int, default=MAX_STEPS,
-                   help="total optimizer steps; raise this to continue a finished run")
+                   help="total optimizer steps; raise to continue a finished run")
     p.add_argument("--batch-size", type=int, default=BATCH_SIZE)
     p.add_argument("--grad-accum", type=int, default=GRAD_ACCUM)
     p.add_argument("--block-size", type=int, default=BLOCK_SIZE)
@@ -355,11 +428,14 @@ if __name__ == "__main__":
     p.add_argument("--warmup-steps", type=int, default=WARMUP_STEPS)
     p.add_argument("--eval-interval", type=int, default=EVAL_INTERVAL)
     p.add_argument("--ckpt-dir", type=str, default=CKPT_DIR)
-    p.add_argument("--no-resume", action="store_true",
-                   help="start fresh, ignoring any existing checkpoint")
+    p.add_argument("--no-resume", action="store_true", help="start fresh, ignoring any checkpoint")
+    p.add_argument("--tst-mode", choices=["off", "full", "output"], default=TST_MODE,
+                   help="off = baseline; full = input+output superposition; output = output-only")
+    p.add_argument("--tst-bag-size", type=int, default=TST_BAG_SIZE, help="superposition bag size s")
+    p.add_argument("--tst-ratio", type=float, default=TST_RATIO,
+                   help="fraction of steps in the superposition phase r")
     args = p.parse_args()
 
-    # override module-level config (functions read these globals at call time)
     MAX_STEPS = args.max_steps
     BATCH_SIZE = args.batch_size
     GRAD_ACCUM = args.grad_accum
@@ -371,14 +447,18 @@ if __name__ == "__main__":
     CKPT_INTERVAL = EVAL_INTERVAL
     CKPT_DIR = args.ckpt_dir
     RESUME = not args.no_resume
+    TST_MODE = args.tst_mode
+    TST_BAG_SIZE = args.tst_bag_size
+    TST_RATIO = args.tst_ratio
 
     train_data = prepare_data("train")
     val_data = prepare_data("validation")
 
-    model = GPT2(max_len=BLOCK_SIZE).to(DEVICE)   # pass block_size explicitly (default was bound at import)
+    model = GPT2(max_len=BLOCK_SIZE).to(DEVICE)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"model parameters: {n_params/1e6:.1f}M | device: {DEVICE} | "
-          f"max_steps {MAX_STEPS} | batch {BATCH_SIZE}x{GRAD_ACCUM} | block {BLOCK_SIZE}")
+          f"max_steps {MAX_STEPS} | batch {BATCH_SIZE}x{GRAD_ACCUM} | block {BLOCK_SIZE} | "
+          f"tst {TST_MODE}")
 
     train(model, train_data, val_data)
     print("Generated:", model.generate("The future of AI is", max_new=40))
