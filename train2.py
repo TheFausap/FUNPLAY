@@ -1,6 +1,9 @@
 import os
 import math
+import json
+import time
 import random
+import datetime
 import argparse
 import numpy as np
 import torch
@@ -51,6 +54,8 @@ CKPT_DIR = "checkpoints"
 CKPT_INTERVAL = EVAL_INTERVAL
 RESUME = True
 COMPILE = False            # torch.compile (most reliable on CUDA)
+LOG_FILE = "results.jsonl" # one appended JSON record per completed run
+RUN_NAME = None            # defaults to the checkpoint dir name
 
 
 def amp_autocast():
@@ -369,6 +374,22 @@ def load_checkpoint(model, optimizer, tag="latest"):
     return ckpt["step"] + 1, ckpt.get("best_val", float("inf"))
 
 
+def raw_tokens_seen(mode, bag, ratio, steps, batch, block):
+    """Raw data tokens consumed over a run. full-superposition steps ingest
+    `bag`x more tokens/step; output/off are token-level like the baseline."""
+    if mode == "full":
+        tst = int(ratio * steps)
+        return tst * batch * block * bag + (steps - tst) * batch * block
+    return steps * batch * block
+
+
+def log_result(record, path):
+    """Append one run as a JSON line (append-only; safe across parallel runs)."""
+    with open(path, "a") as f:
+        f.write(json.dumps(record) + "\n")
+    print(f"logged run '{record.get('run_name')}' -> {path}")
+
+
 # ----------------------------------------------------------------------------
 # Train
 # ----------------------------------------------------------------------------
@@ -381,11 +402,13 @@ def train(model, train_data, val_data):
     start_step, best_val = (load_checkpoint(model, optimizer) if RESUME else (0, float("inf")))
     if start_step >= MAX_STEPS:
         print(f"checkpoint already at step {start_step} >= MAX_STEPS; nothing to do.")
-        return
+        return None
     if TST_MODE != "off":
         print(f"TST: mode={TST_MODE} s={TST_BAG_SIZE} r={TST_RATIO} "
               f"-> superposition for steps [0, {tst_steps}), recovery after.")
 
+    best_step, last_val = -1, float("nan")
+    t0 = time.time()
     model.train()
     pbar = tqdm(range(start_step, MAX_STEPS), initial=start_step, total=MAX_STEPS, desc="training")
     step = start_step
@@ -423,13 +446,14 @@ def train(model, train_data, val_data):
 
             if step % EVAL_INTERVAL == 0 or step == MAX_STEPS - 1:
                 stats = estimate_loss(model, splits, BLOCK_SIZE, BATCH_SIZE, DEVICE, EVAL_ITERS)
+                last_val = stats["val"]
                 tag = " (superposition; val NTP not yet meaningful)" if in_tst else ""
                 print(f"\nstep {step}: train {stats['train']:.4f} | val {stats['val']:.4f} "
                       f"| val ppl {math.exp(stats['val']):.2f}{tag}")
                 save_checkpoint(model, optimizer, step, best_val, tag="latest")
                 # only track "best" during recovery, where val NTP is meaningful
                 if not in_tst and stats["val"] < best_val:
-                    best_val = stats["val"]
+                    best_val, best_step = stats["val"], step
                     save_checkpoint(model, optimizer, step, best_val, tag="best")
                     print(f"  new best val {best_val:.4f} -> ckpt_best.pt")
     except KeyboardInterrupt:
@@ -440,6 +464,13 @@ def train(model, train_data, val_data):
 
     save_checkpoint(model, optimizer, MAX_STEPS - 1, best_val, tag="latest")
     print(f"done. best val loss {best_val:.4f} (ppl {math.exp(best_val):.2f})")
+    return {
+        "best_val": best_val,
+        "best_step": best_step,
+        "final_val": last_val,
+        "final_step": step,
+        "elapsed_min": round((time.time() - t0) / 60, 1),
+    }
 
 
 if __name__ == "__main__":
@@ -463,6 +494,9 @@ if __name__ == "__main__":
     p.add_argument("--dtype", choices=["fp32", "bf16"], default=DTYPE,
                    help="bf16 enables autocast (faster, MPS/CUDA); fp32 for reproducible baselines")
     p.add_argument("--compile", action="store_true", help="wrap model in torch.compile (CUDA)")
+    p.add_argument("--run-name", type=str, default=RUN_NAME,
+                   help="label for the log record (defaults to the checkpoint dir name)")
+    p.add_argument("--log-file", type=str, default=LOG_FILE, help="JSONL results log to append to")
     args = p.parse_args()
 
     MAX_STEPS = args.max_steps
@@ -482,6 +516,8 @@ if __name__ == "__main__":
     DTYPE = args.dtype
     USE_AMP = (DTYPE == "bf16")
     COMPILE = args.compile
+    LOG_FILE = args.log_file
+    RUN_NAME = args.run_name or os.path.basename(CKPT_DIR.rstrip("/")) or "run"
 
     train_data = prepare_data("train")
     val_data = prepare_data("validation")
@@ -499,5 +535,27 @@ if __name__ == "__main__":
           f"compile {COMPILE} | max_steps {MAX_STEPS} | batch {BATCH_SIZE}x{GRAD_ACCUM} | "
           f"block {BLOCK_SIZE} | tst {TST_MODE}")
 
-    train(model, train_data, val_data)
+    results = train(model, train_data, val_data)
+
+    if results is not None:
+        tokens = raw_tokens_seen(TST_MODE, TST_BAG_SIZE, TST_RATIO, MAX_STEPS, BATCH_SIZE, BLOCK_SIZE)
+        bv = results["best_val"]
+        record = {
+            "time": datetime.datetime.now().isoformat(timespec="seconds"),
+            "run_name": RUN_NAME, "ckpt_dir": CKPT_DIR,
+            "device": DEVICE, "dtype": DTYPE, "compile": COMPILE,
+            "n_params_m": round(n_params / 1e6, 1),
+            "max_steps": MAX_STEPS, "batch_size": BATCH_SIZE, "grad_accum": GRAD_ACCUM,
+            "block_size": BLOCK_SIZE, "lr": LR, "min_lr": MIN_LR, "warmup_steps": WARMUP_STEPS,
+            "tst_mode": TST_MODE, "tst_bag_size": TST_BAG_SIZE, "tst_ratio": TST_RATIO,
+            "raw_tokens_seen": tokens,
+            "epochs": round(tokens / len(train_data), 3),
+            "best_val": round(bv, 4),
+            "best_val_ppl": round(math.exp(bv), 2) if bv < float("inf") else None,
+            "best_step": results["best_step"],
+            "final_val": round(results["final_val"], 4),
+            "elapsed_min": results["elapsed_min"],
+        }
+        log_result(record, LOG_FILE)
+
     print("Generated:", raw_model.generate("The future of AI is", max_new=40))
