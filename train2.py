@@ -13,7 +13,18 @@ from transformers import GPT2TokenizerFast
 # ----------------------------------------------------------------------------
 # Config
 # ----------------------------------------------------------------------------
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+def _pick_device():
+    if torch.cuda.is_available():
+        return "cuda"
+    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+DEVICE = _pick_device()
+AUTOCAST_DEVICE = DEVICE if DEVICE in ("cuda", "cpu", "mps") else "cpu"
+DTYPE = "fp32"             # "fp32" or "bf16"; bf16 turns on autocast (no GradScaler needed)
+USE_AMP = False            # derived from DTYPE in __main__
 
 BLOCK_SIZE = 1024          # processed length (s-token positions per sequence)
 BATCH_SIZE = 8
@@ -39,6 +50,13 @@ TST_RATIO = 0.3            # fraction of MAX_STEPS spent in superposition (paper
 CKPT_DIR = "checkpoints"
 CKPT_INTERVAL = EVAL_INTERVAL
 RESUME = True
+COMPILE = False            # torch.compile (most reliable on CUDA)
+
+
+def amp_autocast():
+    """bf16 autocast when DTYPE='bf16'; a no-op context otherwise. backward()
+    must run OUTSIDE this context. bf16 needs no GradScaler (unlike fp16)."""
+    return torch.autocast(device_type=AUTOCAST_DEVICE, dtype=torch.bfloat16, enabled=USE_AMP)
 
 
 # ----------------------------------------------------------------------------
@@ -231,30 +249,33 @@ def standard_loss(logits, y):
 
 
 def mce_loss_full(logits, y, bag_size):
-    """Multi-hot CE for FULL superposition (Appendix A, Listing 3).
-    logits [B, T, V]; y [B, T*bag_size] raw next-token labels.
-    Shift labels left by (bag_size-1) and split into non-overlapping bags, then
-    average per-token CE over the bag (simplified MCE, Eq. 3)."""
+    """Multi-hot CE for FULL superposition (Appendix A, Listing 3), fused.
+    logits [B, T, V]; y [B, T*bag_size] raw next-token labels. Shift labels left
+    by (bag_size-1), split into non-overlapping bags, average per-token CE over
+    the bag (simplified MCE, Eq. 3). The vocab logsumexp is computed ONCE and
+    reused across the bag instead of in `s` separate cross_entropy calls."""
     B, T, V = logits.shape
     offset = bag_size - 1
-    pred = logits.reshape(B * T, V).float()
-    y = F.pad(y, (0, offset), value=-100)[..., offset:].reshape(B, T, bag_size)
-    loss = 0.0
-    for i in range(bag_size):
-        loss = loss + F.cross_entropy(pred, y[..., i].reshape(B * T))  # -100 ignored by default
-    return loss / bag_size
+    pred = logits.reshape(B * T, V).float()                     # [N, V]
+    lse = torch.logsumexp(pred, dim=-1, keepdim=True)           # [N, 1]  (once)
+    y = F.pad(y, (0, offset), value=-100)[..., offset:].reshape(B * T, bag_size)
+    mask = y != -100                                           # ignore padded tail
+    chosen = pred.gather(1, y.clamp_min(0))                     # [N, bag]
+    nll = (lse - chosen).masked_fill(~mask, 0.0)               # [N, bag]
+    per_col = nll.sum(0) / mask.sum(0).clamp_min(1)            # per-slot mean over valid
+    return per_col.mean()                                       # == (1/s) Σ_i CE_i
 
 
 def mce_loss_output(logits, y_bags):
-    """Multi-hot CE for OUTPUT-only superposition: each position predicts its next
-    `bag_size` tokens (overlapping), averaged. y_bags [B, T, bag_size]."""
+    """Multi-hot CE for OUTPUT-only superposition, fused: each position predicts
+    its next `bag_size` tokens (overlapping), averaged. y_bags [B, T, bag_size].
+    All targets are valid (no padding), so one mean over N*bag suffices."""
     B, T, V = logits.shape
     bag_size = y_bags.size(-1)
-    pred = logits.reshape(B * T, V).float()
-    loss = 0.0
-    for i in range(bag_size):
-        loss = loss + F.cross_entropy(pred, y_bags[..., i].reshape(B * T))
-    return loss / bag_size
+    pred = logits.reshape(B * T, V).float()                     # [N, V]
+    lse = torch.logsumexp(pred, dim=-1, keepdim=True)           # [N, 1]  (once)
+    chosen = pred.gather(1, y_bags.reshape(B * T, bag_size))    # [N, bag]
+    return (lse - chosen).mean()                                # == (1/s) Σ_i CE_i
 
 
 @torch.no_grad()
@@ -266,8 +287,10 @@ def estimate_loss(model, splits, block_size, batch_size, device, iters):
         losses = torch.zeros(iters)
         for k in range(iters):
             x, y = get_batch(data, block_size, batch_size, device, mode="standard")
-            logits = model(x)
-            losses[k] = standard_loss(logits, y).item()
+            with amp_autocast():
+                logits = model(x)
+                loss = standard_loss(logits, y)
+            losses[k] = loss.item()
         out[name] = losses.mean().item()
     model.train()
     return out
@@ -309,8 +332,9 @@ def _set_rng_state(state):
 def save_checkpoint(model, optimizer, step, best_val, tag="latest"):
     os.makedirs(CKPT_DIR, exist_ok=True)
     path = os.path.join(CKPT_DIR, f"ckpt_{tag}.pt")
+    raw = getattr(model, "_orig_mod", model)   # unwrap torch.compile so keys are unprefixed
     payload = {
-        "model": model.state_dict(),
+        "model": raw.state_dict(),
         "optimizer": optimizer.state_dict(),
         "step": step,
         "best_val": best_val,
@@ -318,7 +342,7 @@ def save_checkpoint(model, optimizer, step, best_val, tag="latest"):
         "config": {"BLOCK_SIZE": BLOCK_SIZE, "BATCH_SIZE": BATCH_SIZE,
                    "GRAD_ACCUM": GRAD_ACCUM, "MAX_STEPS": MAX_STEPS,
                    "TST_MODE": TST_MODE, "TST_BAG_SIZE": TST_BAG_SIZE,
-                   "TST_RATIO": TST_RATIO},
+                   "TST_RATIO": TST_RATIO, "DTYPE": DTYPE},
     }
     tmp = path + ".tmp"
     torch.save(payload, tmp)
@@ -335,7 +359,8 @@ def load_checkpoint(model, optimizer, tag="latest"):
     cfg = ckpt.get("config", {})
     if cfg.get("BLOCK_SIZE") not in (None, BLOCK_SIZE):
         print(f"  warning: checkpoint BLOCK_SIZE={cfg['BLOCK_SIZE']} != current {BLOCK_SIZE}")
-    model.load_state_dict(ckpt["model"])
+    raw = getattr(model, "_orig_mod", model)   # works whether or not model is compiled
+    raw.load_state_dict(ckpt["model"])
     optimizer.load_state_dict(ckpt["optimizer"])
     try:
         _set_rng_state(ckpt["rng"])
@@ -381,14 +406,15 @@ def train(model, train_data, val_data):
             optimizer.zero_grad(set_to_none=True)
             for _ in range(GRAD_ACCUM):
                 x, y = get_batch(train_data, BLOCK_SIZE, BATCH_SIZE, DEVICE, mode=mode, bag_size=bag)
-                logits = model(x)
-                if mode == "full":
-                    loss = mce_loss_full(logits, y, bag)
-                elif mode == "output":
-                    loss = mce_loss_output(logits, y)
-                else:
-                    loss = standard_loss(logits, y)
-                (loss / GRAD_ACCUM).backward()
+                with amp_autocast():
+                    logits = model(x)
+                    if mode == "full":
+                        loss = mce_loss_full(logits, y, bag)
+                    elif mode == "output":
+                        loss = mce_loss_output(logits, y)
+                    else:
+                        loss = standard_loss(logits, y)
+                (loss / GRAD_ACCUM).backward()   # backward outside autocast
 
             torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
             optimizer.step()
@@ -434,6 +460,9 @@ if __name__ == "__main__":
     p.add_argument("--tst-bag-size", type=int, default=TST_BAG_SIZE, help="superposition bag size s")
     p.add_argument("--tst-ratio", type=float, default=TST_RATIO,
                    help="fraction of steps in the superposition phase r")
+    p.add_argument("--dtype", choices=["fp32", "bf16"], default=DTYPE,
+                   help="bf16 enables autocast (faster, MPS/CUDA); fp32 for reproducible baselines")
+    p.add_argument("--compile", action="store_true", help="wrap model in torch.compile (CUDA)")
     args = p.parse_args()
 
     MAX_STEPS = args.max_steps
@@ -450,15 +479,25 @@ if __name__ == "__main__":
     TST_MODE = args.tst_mode
     TST_BAG_SIZE = args.tst_bag_size
     TST_RATIO = args.tst_ratio
+    DTYPE = args.dtype
+    USE_AMP = (DTYPE == "bf16")
+    COMPILE = args.compile
 
     train_data = prepare_data("train")
     val_data = prepare_data("validation")
 
     model = GPT2(max_len=BLOCK_SIZE).to(DEVICE)
-    n_params = sum(p.numel() for p in model.parameters())
-    print(f"model parameters: {n_params/1e6:.1f}M | device: {DEVICE} | "
-          f"max_steps {MAX_STEPS} | batch {BATCH_SIZE}x{GRAD_ACCUM} | block {BLOCK_SIZE} | "
-          f"tst {TST_MODE}")
+    raw_model = model                          # keep an uncompiled handle for generate/state_dict
+    if COMPILE:
+        if DEVICE != "cuda":
+            print(f"warning: --compile on device '{DEVICE}'; torch.compile is most reliable on CUDA.")
+        print("compiling with torch.compile (first step + first eval warm up slowly)...")
+        model = torch.compile(model)
+
+    n_params = sum(p.numel() for p in raw_model.parameters())
+    print(f"model parameters: {n_params/1e6:.1f}M | device: {DEVICE} | dtype {DTYPE} | "
+          f"compile {COMPILE} | max_steps {MAX_STEPS} | batch {BATCH_SIZE}x{GRAD_ACCUM} | "
+          f"block {BLOCK_SIZE} | tst {TST_MODE}")
 
     train(model, train_data, val_data)
-    print("Generated:", model.generate("The future of AI is", max_new=40))
+    print("Generated:", raw_model.generate("The future of AI is", max_new=40))
